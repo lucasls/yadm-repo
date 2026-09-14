@@ -115,6 +115,18 @@ source $ZSH/oh-my-zsh.sh
 # alias zshconfig="mate ~/.zshrc"
 # alias ohmyzsh="mate ~/.oh-my-zsh"
 
+# yadm aliases (mirrors the oh-my-zsh git aliases: gst/gp/gl/gcl -> yst/yp/yl/ycl)
+alias yst='yadm status'
+alias yp='yadm push'
+alias yl='yadm pull'
+alias ycl='yadm clone'
+alias ya='yadm add'
+alias yau='yadm add -u'
+alias yc='yadm commit --verbose'
+alias ycam='yadm commit --all --message'
+alias yf='yadm fetch'
+alias yalt='yadm alt'
+
 {% if yadm.os == "Darwin" %}
 # MacOS Functions
 function keychain-set() {
@@ -206,14 +218,15 @@ function gitStashSaveStaged() {
 }
 
 {% if yadm.hostname == "lucas-macbook" %}
-MY_CLAUDE_DEFAULT_DIR="~/work"
+MY_CLAUDE_DEFAULT_DIR="$HOME/work"
 {% else %}
-MY_CLAUDE_DEFAULT_DIR="~/code"
+MY_CLAUDE_DEFAULT_DIR="$HOME/code"
 {% endif %}
 
 function claude() {
     if [[ "$PWD" == "$HOME" ]]; then
         echo "Switching to $MY_CLAUDE_DEFAULT_DIR before running claude"
+        mkdir -p "$MY_CLAUDE_DEFAULT_DIR"
         (cd "$MY_CLAUDE_DEFAULT_DIR" && claude "$@")
     else
         command claude "$@"
