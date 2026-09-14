@@ -225,11 +225,6 @@ compdef _gnu_generic claude
 [[ -d "$HOME/apps" ]] && export PATH=$PATH:$(find $HOME/apps -type d -maxdepth 1 | paste -sd ":" -) # all subfolders of ~/apps
 export PATH="$PATH":"$HOME/.local/bin"
 
-# Created by `pipx` on 2024-02-06 11:17:30
-export PYENV_ROOT="$HOME/.pyenv"
-[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
-eval "$(pyenv init -)"
-
 # SDKMAN
 export SDKMAN_DIR="$HOME/.sdkman"
 [[ -s "$HOME/.sdkman/bin/sdkman-init.sh" ]] && source "$HOME/.sdkman/bin/sdkman-init.sh"
