@@ -205,6 +205,22 @@ function gitStashSaveStaged() {
     git stash push -S -m"(Save) $@"
 }
 
+{% if yadm.hostname == "lucas-macbook" %}
+MY_CLAUDE_DEFAULT_DIR="~/work"
+{% else %}
+MY_CLAUDE_DEFAULT_DIR="~/code"
+{% endif %}
+
+function claude() {
+    if [[ "$PWD" == "$HOME" ]]; then
+        echo "Switching to $MY_CLAUDE_DEFAULT_DIR before running claude"
+        (cd "$MY_CLAUDE_DEFAULT_DIR" && claude "$@")
+    else
+        command claude "$@"
+    fi
+}
+compdef _gnu_generic claude
+
 # Custom PATH settings
 [[ -d "$HOME/apps" ]] && export PATH=$PATH:$(find $HOME/apps -type d -maxdepth 1 | paste -sd ":" -) # all subfolders of ~/apps
 export PATH="$PATH":"$HOME/.local/bin"
