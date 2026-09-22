@@ -127,6 +127,20 @@ alias ycam='yadm commit --all --message'
 alias yf='yadm fetch'
 alias yalt='yadm alt'
 
+# yadm work aliases
+alias ywork='yadm --yadm-dir ~/.config/yadm-work --yadm-data ~/.local/share/yadm-work'
+
+alias ywst='ywork status'
+alias ywp='ywork push'
+alias ywl='ywork pull'
+alias ywcl='ywork clone'
+alias ywa='ywork add'
+alias ywau='ywork add -u'
+alias ywc='ywork commit --verbose'
+alias ywcam='ywork commit --all --message'
+alias ywf='ywork fetch'
+alias ywalt='ywork alt'
+
 {% if yadm.os == "Darwin" %}
 # MacOS Functions
 function keychain-set() {
@@ -246,4 +260,9 @@ export SDKMAN_DIR="$HOME/.sdkman"
 # Local overrides, not syced by YADM
 if [[ -f "$HOME/.zshrc.local" ]]; then
     source "$HOME/.zshrc.local"
+fi
+
+# Local overrides, not syced by YADM
+if [[ -f "$HOME/.zshrc.work" ]]; then
+    source "$HOME/.zshrc.work"
 fi
