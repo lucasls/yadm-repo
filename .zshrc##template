@@ -73,15 +73,12 @@ ZSH_THEME="robbyrussell"
 # Add wisely, as too many plugins slow down shell startup.
 plugins=(
     git
-    # docker
-    # kubectl
     zsh-syntax-highlighting
-    # brew
-    # alias-tips
+    zsh-autosuggestions
+    zsh-claudecode-completion
+    alias-tips
     # gitfast
-    # gradle
 )
-
 {% if yadm.os == "Darwin" %}
 FPATH="/opt/homebrew/share/zsh/site-functions:${FPATH}" # homebrew completion
 {% endif %}
@@ -246,7 +243,6 @@ function claude() {
         command claude "$@"
     fi
 }
-compdef _gnu_generic claude
 
 # Custom PATH settings
 [[ -d "$HOME/apps" ]] && export PATH=$PATH:$(find $HOME/apps -type d -maxdepth 1 | paste -sd ":" -) # all subfolders of ~/apps
