@@ -9,15 +9,56 @@ export ZSH="$HOME/.oh-my-zsh"
 # load a random theme each time oh-my-zsh is loaded, in which case,
 # to know which specific one was loaded, run: echo $RANDOM_THEME
 # See https://github.com/ohmyzsh/ohmyzsh/wiki/Themes
-{% if yadm.os == "Darwin" %}
-if [ "$(defaults read -g AppleInterfaceStyle 2>/dev/null)" = "Dark" ]; then
-    ZSH_THEME="robbyrussell"
-else
-    ZSH_THEME="robbyrussell-light"
-fi
-{% else %}
-ZSH_THEME="robbyrussell"
-{% endif %}
+# Ask the terminal itself for its background color via the OSC 11 escape
+# sequence, rather than the host OS. This is emulator-level, not OS-level,
+# so it works the same on macOS/Linux and correctly follows the *client*
+# terminal's theme over SSH (the query/response travels over the pty
+# end-to-end, answered by whatever is rendering the display, not the host).
+function _terminal_is_dark() {
+    [[ -t 1 ]] || return 2
+    # Apple's Terminal.app doesn't answer OSC 11 queries; skip straight to
+    # the OS-level fallback rather than risk leaving the tty in raw mode.
+    [[ "$TERM_PROGRAM" == "Apple_Terminal" ]] && return 2
+    local response old_stty
+    old_stty=$(stty -g 2>/dev/null) || return 2
+    {
+        stty raw -echo min 0 time 3 2>/dev/null
+        printf '\033]11;?\033\\' >/dev/tty
+        IFS= read -r -t 0.3 -d $'\\' response </dev/tty
+    } always {
+        # Guaranteed to run even if the read above times out or errors, so
+        # the terminal is never left stuck in raw/no-echo mode.
+        stty "$old_stty" 2>/dev/null
+    }
+
+    if [[ "$response" =~ rgb:([0-9a-fA-F]{2,4})/([0-9a-fA-F]{2,4})/([0-9a-fA-F]{2,4}) ]]; then
+        local r=$((16#${match[1]:0:2}))
+        local g=$((16#${match[2]:0:2}))
+        local b=$((16#${match[3]:0:2}))
+        (( (r * 299 + g * 587 + b * 114) / 1000 < 128 ))
+        return $?
+    fi
+    return 2
+}
+
+_terminal_is_dark
+case $? in
+    0) ZSH_THEME="robbyrussell" ;;
+    1) ZSH_THEME="robbyrussell-light" ;;
+    *)
+        # Terminal didn't answer (unsupported, or a multiplexer swallowing
+        # the escape sequence without passthrough enabled).
+        {% if yadm.os == "Darwin" %}
+        if [ "$(defaults read -g AppleInterfaceStyle 2>/dev/null)" = "Dark" ]; then
+            ZSH_THEME="robbyrussell"
+        else
+            ZSH_THEME="robbyrussell-light"
+        fi
+        {% else %}
+        ZSH_THEME="robbyrussell"
+        {% endif %}
+        ;;
+esac
 
 # Set list of themes to pick from when loading at random
 # Setting this variable when ZSH_THEME=random will cause zsh to load
