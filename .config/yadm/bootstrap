@@ -64,3 +64,31 @@ clone_or_pull alias-tips https://github.com/djui/alias-tips.git
 echo "yadm bootstrap: linking custom theme"
 mkdir -p "$ZSH_CUSTOM/themes"
 ln -sf "$HOME/.config/yadm/zsh-theme/robbyrussell-light.zsh-theme" "$ZSH_CUSTOM/themes/robbyrussell-light.zsh-theme"
+
+echo "yadm bootstrap: ensuring cron is available for dotfiles autosync"
+if ! command -v crontab >/dev/null 2>&1; then
+    case "$OS" in
+        Linux)
+            if command -v apt-get >/dev/null 2>&1; then
+                sudo apt-get update
+                sudo apt-get install -y cron
+                sudo systemctl enable --now cron
+            else
+                echo "yadm bootstrap: no apt-get found, install/enable cron manually" >&2
+            fi
+            ;;
+        Darwin)
+            echo "yadm bootstrap: crontab missing on macOS, install/enable manually" >&2
+            ;;
+    esac
+fi
+
+AUTOSYNC_SCRIPT="$HOME/.local/bin/yadm-autosync.sh"
+if command -v crontab >/dev/null 2>&1 && [ -x "$AUTOSYNC_SCRIPT" ]; then
+    echo "yadm bootstrap: ensuring dotfiles autosync cron job is registered"
+    if ! crontab -l 2>/dev/null | grep -qF "$AUTOSYNC_SCRIPT"; then
+        CRON_LINE="0 * * * * /usr/bin/env bash $AUTOSYNC_SCRIPT >> $HOME/.local/share/yadm-autosync.log 2>&1"
+        (crontab -l 2>/dev/null; echo "$CRON_LINE") | crontab -
+        echo "yadm bootstrap: registered autosync cron job"
+    fi
+fi
