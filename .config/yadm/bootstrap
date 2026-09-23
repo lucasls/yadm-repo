@@ -1,0 +1,66 @@
+#!/bin/bash
+# Installs zsh + oh-my-zsh if needed, then clones/pulls custom plugins
+# and links the custom theme. Supports macOS and Ubuntu.
+set -e
+
+OS="$(uname -s)"
+
+echo "yadm bootstrap: ensuring zsh is installed"
+if ! command -v zsh >/dev/null 2>&1; then
+    case "$OS" in
+        Darwin)
+            brew install zsh
+            ;;
+        Linux)
+            if command -v apt-get >/dev/null 2>&1; then
+                sudo apt-get update
+                sudo apt-get install -y zsh
+            else
+                echo "yadm bootstrap: no apt-get found, install zsh manually" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "yadm bootstrap: unsupported OS '$OS', install zsh manually" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+ZSH_BIN="$(command -v zsh)"
+
+echo "yadm bootstrap: ensuring zsh is the default shell"
+if [ "$SHELL" != "$ZSH_BIN" ]; then
+    grep -qxF "$ZSH_BIN" /etc/shells || echo "$ZSH_BIN" | sudo tee -a /etc/shells >/dev/null
+    chsh -s "$ZSH_BIN"
+fi
+
+echo "yadm bootstrap: ensuring oh-my-zsh is installed"
+if [ ! -d "$HOME/.oh-my-zsh" ]; then
+    KEEP_ZSHRC=yes RUNZSH=no CHSH=no sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+fi
+
+ZSH_CUSTOM="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}"
+
+clone_or_pull() {
+    name="$1"
+    repo="$2"
+    dest="$ZSH_CUSTOM/plugins/$name"
+
+    if [ -d "$dest/.git" ]; then
+        echo "yadm bootstrap: updating $name"
+        git -C "$dest" pull --ff-only --quiet
+    else
+        echo "yadm bootstrap: cloning $name"
+        git clone --quiet "$repo" "$dest"
+    fi
+}
+
+clone_or_pull zsh-syntax-highlighting https://github.com/zsh-users/zsh-syntax-highlighting.git
+clone_or_pull zsh-autosuggestions https://github.com/zsh-users/zsh-autosuggestions.git
+clone_or_pull zsh-claudecode-completion https://github.com/wbingli/zsh-claudecode-completion.git
+clone_or_pull alias-tips https://github.com/djui/alias-tips.git
+
+echo "yadm bootstrap: linking custom theme"
+mkdir -p "$ZSH_CUSTOM/themes"
+ln -sf "$HOME/.config/yadm/zsh-theme/robbyrussell-light.zsh-theme" "$ZSH_CUSTOM/themes/robbyrussell-light.zsh-theme"
