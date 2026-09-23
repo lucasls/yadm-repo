@@ -5,6 +5,12 @@ set -euo pipefail
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
+LOG_FILE="$HOME/.local/share/yadm-autosync.log"
+MAX_LOG_BYTES=$((1024 * 1024))
+if [ -f "$LOG_FILE" ] && [ "$(wc -c <"$LOG_FILE")" -gt "$MAX_LOG_BYTES" ]; then
+  mv -f "$LOG_FILE" "$LOG_FILE.1"
+fi
+
 MSG="Automated dotfiles sync"
 
 sync_repo() {
