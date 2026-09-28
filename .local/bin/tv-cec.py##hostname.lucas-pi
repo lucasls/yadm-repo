@@ -13,7 +13,12 @@ key to the TV. It only reacts to that change, never to the Chromecast merely sit
 standby, so watching another input is safe as long as the Chromecast doesn't drop to
 standby on its own when you switch away (see the log after testing that).
 
-Usage: python3 tv-cec.py [-d /dev/cec1] [-i 3] [--delay 5] [--dry-run]
+TV wake: when the Chromecast wakes (standby -> on) while the TV is in standby, the TV is
+expected to turn on by itself. If it is still in standby --wake-delay seconds later, the Pi
+sends the explicit remote-control key "Power On Function" (the counterpart of the off key,
+not a toggle), retrying a few times. It does nothing if the TV comes on by itself.
+
+Usage: python3 tv-cec.py [-d /dev/cec1] [-i 3] [--delay 5] [--wake-delay 8] [--no-wake] [--dry-run]
 Log:   stdout (journal under systemd) and ~/.local/share/tv-cec.log
 """
 import argparse
@@ -131,6 +136,72 @@ def power_off_tv(dev: str) -> None:
     cec(dev, "--to", str(TV), "--user-control-released")
 
 
+def power_on_tv(dev: str) -> None:
+    """Remote-control 'Power On Function' key: an explicit on, not a toggle."""
+    cec(dev, "--to", str(TV), "--user-control-pressed", "ui-cmd=power-on-function")
+    cec(dev, "--to", str(TV), "--user-control-released")
+
+
+class WakeTrigger:
+    """Fire when the Chromecast wakes but the TV stays in standby.
+
+    Arms on Chromecast asleep -> awake while the TV is in standby; a Chromecast that wakes
+    because the TV is already on never arms it. If the TV is still in standby --wake-delay
+    seconds later it fires, then retries every --wake-delay seconds, MAX_ATTEMPTS in all.
+    While the TV is unreachable (typically booting) it waits without firing.
+    """
+
+    MAX_ATTEMPTS = 3
+    GIVE_UP_S = 60
+
+    def __init__(self, delay: float):
+        self.delay = delay
+        self.cc_prev: str | None = None
+        self.armed_at: float | None = None  # last fire, or arm time
+        self.first_at = 0.0
+        self.attempts = 0
+        self.cooldown_until = 0.0
+
+    def _disarm(self) -> None:
+        self.armed_at = None
+
+    def step(self, now: float, tv: str, cc: str) -> tuple[str | None, bool]:
+        """Return (message, fire)."""
+        msg, fire = None, False
+        if self.armed_at is None:
+            if (self.cc_prev in ASLEEP and cc in AWAKE and tv == "standby"
+                    and now >= self.cooldown_until):
+                self.armed_at = self.first_at = now
+                self.attempts = 0
+                msg = (f"Chromecast {self.cc_prev} -> {cc} with TV in standby: "
+                       f"waiting {self.delay:g}s for the TV to turn on by itself")
+        else:
+            waited = now - self.first_at
+            if tv in AWAKE:
+                sent = f", after {self.attempts} Power On" if self.attempts else ", by itself"
+                msg = f"TV is {tv} {waited:.0f}s after the Chromecast woke{sent}"
+                self._disarm()
+            elif cc in ASLEEP:
+                msg = f"Chromecast is {cc} again: wake cancelled"
+                self._disarm()
+            elif waited > self.GIVE_UP_S:
+                msg = f"TV still {tv} {waited:.0f}s after the Chromecast woke: giving up"
+                self._disarm()
+                self.cooldown_until = now + COOLDOWN_S
+            elif tv == "standby" and now - self.armed_at >= self.delay:
+                self.attempts += 1
+                fire = True
+                msg = (f"TV still in standby {waited:.0f}s after the Chromecast woke: "
+                       f"Power On attempt {self.attempts}/{self.MAX_ATTEMPTS}")
+                self.armed_at = now
+                if self.attempts >= self.MAX_ATTEMPTS:
+                    self._disarm()
+                    self.cooldown_until = now + COOLDOWN_S
+        if not cc.startswith(NA):
+            self.cc_prev = cc
+        return msg, fire
+
+
 class Trigger:
     """Fire once when the Chromecast goes awake -> asleep and the TV is still on.
 
@@ -174,17 +245,23 @@ def main() -> None:
     ap.add_argument("-i", "--interval", type=float, default=3.0)
     ap.add_argument("--delay", type=float, default=5.0,
                     help="seconds the Chromecast must stay in standby before the TV is turned off")
+    ap.add_argument("--wake-delay", type=float, default=8.0,
+                    help="seconds the TV may stay in standby after the Chromecast wakes "
+                         "before Power On is sent")
+    ap.add_argument("--no-wake", action="store_true", help="never send Power On to the TV")
     ap.add_argument("--dry-run", action="store_true", help="log what would be sent, send nothing")
     args = ap.parse_args()
     dev = args.device
 
     _log_file = open(LOG_PATH, "a")
     log(f"start: dev={dev} interval={args.interval:g}s delay={args.delay:g}s "
+        f"wake={'off' if args.no_wake else f'{args.wake_delay:g}s'} "
         f"dry_run={args.dry_run} ({adapter_info(dev)})")
     if needs_register(dev):
         register(dev)
 
     trigger = Trigger(args.delay)
+    wake = None if args.no_wake else WakeTrigger(args.wake_delay)
     last: dict[int, str] = {}
     since: dict[int, float] = {}
     polls = 0
@@ -214,6 +291,17 @@ def main() -> None:
                 else:
                     power_off_tv(dev)
                     log("sent Power Off Function to TV")
+
+            if wake:
+                msg, fire = wake.step(now, states[TV], states[CHROMECAST])
+                if msg:
+                    log(msg)
+                if fire:
+                    if args.dry_run:
+                        log("DRY RUN: would send Power On Function to TV")
+                    else:
+                        power_on_tv(dev)
+                        log("sent Power On Function to TV")
 
             if sys.stdout.isatty():
                 parts = " | ".join(f"{NAMES[a]} {v} ({now - since[a]:.0f}s)" for a, v in last.items())
