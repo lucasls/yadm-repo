@@ -1,0 +1,10 @@
+[Unit]
+Description=TV CEC keep-awake and Chromecast-to-TV power-off bridge
+
+[Service]
+ExecStart=/usr/bin/python3 -u %h/.local/bin/tv-cec.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

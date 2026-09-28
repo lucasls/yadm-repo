@@ -98,3 +98,17 @@ else
         fi
     fi
 fi
+
+# lucas-pi only: TV CEC keep-awake + Chromecast->TV power-off bridge.
+# The script (tv-cec.py##hostname.lucas-pi) and unit are tracked; enabling is per-host state.
+# Runs on every pull (post_pull hook), so it must stay idempotent and never fail the hook.
+if [ "$(hostname)" = "lucas-pi" ] && command -v systemctl >/dev/null 2>&1 \
+        && [ -f "$HOME/.config/systemd/user/tv-cec.service" ] && [ -x "$HOME/.local/bin/tv-cec.py" ]; then
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"  # unset under cron
+    if ! systemctl --user is-enabled -q tv-cec.service 2>/dev/null; then
+        echo "yadm bootstrap: enabling tv-cec.service"
+        systemctl --user daemon-reload \
+            && systemctl --user enable --now tv-cec.service \
+            || echo "yadm bootstrap: could not enable tv-cec.service (no user systemd session?)" >&2
+    fi
+fi

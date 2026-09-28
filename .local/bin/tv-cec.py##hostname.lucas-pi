@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Keep the TV's CEC awake and turn the TV off when the Chromecast goes to standby.
+
+Every INTERVAL seconds, over the Pi's HDMI CEC adapter, this asks the TV (address 0)
+and the Chromecast (address 8) for their power status. The regular TV query is the
+keep-awake. Each poll ends in a power state (on, standby, to-standby, to-on) or
+"NOT ACCESSIBLE (<reason>)".
+
+TV shutdown: this TV ignores the CEC STANDBY frame the Chromecast sends, but obeys the
+remote-control key "Power Off Function". So when the Chromecast changes from on to
+standby, and stays there for --delay seconds, and the TV is still on, the Pi sends that
+key to the TV. It only reacts to that change, never to the Chromecast merely sitting in
+standby, so watching another input is safe as long as the Chromecast doesn't drop to
+standby on its own when you switch away (see the log after testing that).
+
+Usage: python3 tv-cec.py [-d /dev/cec1] [-i 3] [--delay 5] [--dry-run]
+Log:   stdout (journal under systemd) and ~/.local/share/tv-cec.log
+"""
+import argparse
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+LOG_PATH = Path.home() / ".local" / "share" / "tv-cec.log"
+TV, CHROMECAST = 0, 8
+NAMES = {TV: "TV", CHROMECAST: "Chromecast"}
+ASLEEP = {"standby", "to-standby"}
+AWAKE = {"on", "to-on"}
+HEARTBEAT_S = 60
+COOLDOWN_S = 30
+NA = "NOT ACCESSIBLE"
+
+_log_file = None
+_live_shown = False
+
+
+def log(msg: str) -> None:
+    global _live_shown
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
+    if _live_shown:
+        print("\r\033[K", end="")
+        _live_shown = False
+    print(line, flush=True)
+    if _log_file:
+        _log_file.write(line + "\n")
+        _log_file.flush()
+
+
+def cec(dev: str, *args: str) -> str:
+    try:
+        r = subprocess.run(["cec-ctl", "-d", dev, *args], capture_output=True,
+                           text=True, timeout=15)
+        return r.stdout + r.stderr
+    except subprocess.TimeoutExpired:
+        return "cec-ctl timed out"
+    except OSError as e:
+        return f"cec-ctl failed to run: {e}"
+
+
+def hdmi_status(adapter_out: str) -> str:
+    m = re.search(r"DRM Connector Info\s*:\s*card (\d+), connector (\d+)", adapter_out)
+    if not m:
+        return "unknown"
+    card, conn_id = m.groups()
+    for d in Path("/sys/class/drm").glob(f"card{card}-*"):
+        try:
+            if (d / "connector_id").read_text().strip() == conn_id:
+                return (d / "status").read_text().strip()
+        except OSError:
+            pass
+    return "unknown"
+
+
+def diagnose(dev: str, fallback: str) -> str:
+    out = cec(dev)
+    if "Failed to open" in out or "No such file" in out:
+        return "CEC device missing"
+    if hdmi_status(out) == "disconnected":
+        return "HDMI disconnected"
+    pa = re.search(r"Physical Address\s*:\s*(\S+)", out)
+    if pa and pa.group(1) == "f.f.f.f":
+        return "no physical address"
+    mask = re.search(r"Logical Address Mask\s*:\s*0x([0-9a-fA-F]+)", out)
+    if mask and int(mask.group(1), 16) == 0:
+        return "adapter unregistered"
+    return fallback
+
+
+def query(dev: str, addr: int) -> str:
+    """A power state, or 'NOT ACCESSIBLE (reason)'."""
+    out = cec(dev, "--to", str(addr), "--give-device-power-status")
+    m = re.search(r"pwr-state:\s*(\S+)", out)
+    if m:
+        return m.group(1)
+    if "Not Acknowledged" in out:
+        reason = "no CEC ack"
+    elif "Timeout" in out and "cec-ctl timed out" not in out:
+        reason = "acked, no reply"
+    else:
+        last = [l.strip() for l in out.splitlines() if l.strip()]
+        reason = "error: " + (last[-1] if last else "no output")
+    return f"{NA} ({diagnose(dev, reason)})"
+
+
+def register(dev: str) -> None:
+    """(Re)claim a playback logical address. Never sends Active Source."""
+    out = cec(dev, "--playback", "-o", "Pi-watch")
+    m = re.search(r"Logical Address\s*:\s*(\d+)", out)
+    log(f"registered on {dev}: logical address {m.group(1) if m else '?'}")
+
+
+def adapter_info(dev: str) -> str:
+    out = cec(dev)
+    pa = re.search(r"Physical Address\s*:\s*(\S+)", out)
+    mask = re.search(r"Logical Address Mask\s*:\s*(\S+)", out)
+    return (f"phys={pa.group(1) if pa else '?'} mask={mask.group(1) if mask else '?'} "
+            f"hdmi={hdmi_status(out)}")
+
+
+def needs_register(dev: str) -> bool:
+    mask = re.search(r"Logical Address Mask\s*:\s*0x([0-9a-fA-F]+)", cec(dev))
+    return bool(mask) and int(mask.group(1), 16) == 0
+
+
+def power_off_tv(dev: str) -> None:
+    """Remote-control 'Power Off Function' key; this TV ignores plain STANDBY."""
+    cec(dev, "--to", str(TV), "--user-control-pressed", "ui-cmd=power-off-function")
+    cec(dev, "--to", str(TV), "--user-control-released")
+
+
+class Trigger:
+    """Fire once when the Chromecast goes awake -> asleep and the TV is still on.
+
+    step() takes the latest states and returns None, or a log message when the TV
+    should be turned off now. Time is passed in so this is testable.
+    """
+
+    def __init__(self, delay: float):
+        self.delay = delay
+        self.cc_prev: str | None = None
+        self.armed_at: float | None = None
+        self.cooldown_until = 0.0
+
+    def step(self, now: float, tv: str, cc: str) -> tuple[str | None, bool]:
+        """Return (message, fire)."""
+        msg = None
+        if self.cc_prev in AWAKE and cc in ASLEEP and now >= self.cooldown_until:
+            if tv == "on":
+                self.armed_at = now
+                msg = f"Chromecast {self.cc_prev} -> {cc} with TV on: waiting {self.delay:g}s"
+            else:
+                msg = f"Chromecast {self.cc_prev} -> {cc} but TV is {tv}: nothing to do"
+        elif self.armed_at is not None and cc not in ASLEEP:
+            self.armed_at = None
+            msg = f"Chromecast is {cc} again: cancelled"
+        self.cc_prev = cc if not cc.startswith(NA) else self.cc_prev
+
+        if self.armed_at is not None and now - self.armed_at >= self.delay:
+            self.armed_at = None
+            if tv == "on":
+                self.cooldown_until = now + COOLDOWN_S
+                return f"Chromecast still {cc} and TV still on: turning TV off", True
+            return f"TV is {tv} now: not sending power-off", False
+        return msg, False
+
+
+def main() -> None:
+    global _log_file, _live_shown
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-d", "--device", default="/dev/cec1")
+    ap.add_argument("-i", "--interval", type=float, default=3.0)
+    ap.add_argument("--delay", type=float, default=5.0,
+                    help="seconds the Chromecast must stay in standby before the TV is turned off")
+    ap.add_argument("--dry-run", action="store_true", help="log what would be sent, send nothing")
+    args = ap.parse_args()
+    dev = args.device
+
+    _log_file = open(LOG_PATH, "a")
+    log(f"start: dev={dev} interval={args.interval:g}s delay={args.delay:g}s "
+        f"dry_run={args.dry_run} ({adapter_info(dev)})")
+    if needs_register(dev):
+        register(dev)
+
+    trigger = Trigger(args.delay)
+    last: dict[int, str] = {}
+    since: dict[int, float] = {}
+    polls = 0
+    next_beat = time.monotonic() + HEARTBEAT_S
+    next_poll = time.monotonic()
+    try:
+        while True:
+            now = time.monotonic()
+            states = {addr: query(dev, addr) for addr in (TV, CHROMECAST)}
+            polls += 1
+            if any("adapter unregistered" in s for s in states.values()):
+                register(dev)
+
+            for addr, st in states.items():
+                if last.get(addr) != st:
+                    dur = f" (was {last[addr]} for {now - since[addr]:.0f}s)" if addr in last else ""
+                    log(f"{NAMES[addr]}: {st}{dur}")
+                    last[addr] = st
+                    since[addr] = now
+
+            msg, fire = trigger.step(now, states[TV], states[CHROMECAST])
+            if msg:
+                log(msg)
+            if fire:
+                if args.dry_run:
+                    log("DRY RUN: would send Power Off Function to TV")
+                else:
+                    power_off_tv(dev)
+                    log("sent Power Off Function to TV")
+
+            if sys.stdout.isatty():
+                parts = " | ".join(f"{NAMES[a]} {v} ({now - since[a]:.0f}s)" for a, v in last.items())
+                print(f"\r\033[K{datetime.now():%H:%M:%S} {parts}", end="", flush=True)
+                _live_shown = True
+
+            if now >= next_beat:
+                log("heartbeat: " + " ".join(f"{NAMES[a]}={v}" for a, v in last.items())
+                    + f" polls={polls} ({adapter_info(dev)})")
+                next_beat = now + HEARTBEAT_S
+
+            next_poll += args.interval
+            time.sleep(max(0.0, next_poll - time.monotonic()))
+            if next_poll < time.monotonic() - 5:
+                next_poll = time.monotonic()
+    except KeyboardInterrupt:
+        log(f"stopped after {polls} polls")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
