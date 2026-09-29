@@ -14,11 +14,12 @@ standby, so watching another input is safe as long as the Chromecast doesn't dro
 standby on its own when you switch away (see the log after testing that).
 
 TV wake: when the Chromecast wakes (standby -> on) while the TV is in standby, the TV is
-expected to turn on by itself. If it is still in standby --wake-delay seconds later, the Pi
-sends the explicit remote-control key "Power On Function" (the counterpart of the off key,
-not a toggle), retrying a few times. It does nothing if the TV comes on by itself.
+expected to turn on by itself, but in practice this Chromecast's own wake signal doesn't
+reach the TV, so the Pi sends the explicit remote-control key "Power On Function" (the
+counterpart of the off key, not a toggle) almost immediately, retrying every --wake-delay
+seconds until the TV answers. It does nothing if the TV comes on by itself first.
 
-Usage: python3 tv-cec.py [-d /dev/cec1] [-i 3] [--delay 5] [--wake-delay 8] [--no-wake] [--dry-run]
+Usage: python3 tv-cec.py [-d /dev/cec1] [-i 3] [--delay 5] [--wake-delay 3] [--no-wake] [--dry-run]
 Log:   stdout (journal under systemd) and ~/.local/share/tv-cec.log
 """
 import argparse
@@ -130,28 +131,38 @@ def needs_register(dev: str) -> bool:
     return bool(mask) and int(mask.group(1), 16) == 0
 
 
-def power_off_tv(dev: str) -> None:
+def _press_release(dev: str, ui_cmd: str) -> str:
+    """Send a remote-control key to the TV; return 'acked' or the failure, from the press."""
+    out = cec(dev, "--to", str(TV), "--user-control-pressed", f"ui-cmd={ui_cmd}")
+    cec(dev, "--to", str(TV), "--user-control-released")
+    if "Not Acknowledged" in out:
+        return "NACK (TV CEC not listening)"
+    if "Failed" in out or "timed out" in out:
+        return "error: " + out.strip().splitlines()[-1]
+    return "acked"
+
+
+def power_off_tv(dev: str) -> str:
     """Remote-control 'Power Off Function' key; this TV ignores plain STANDBY."""
-    cec(dev, "--to", str(TV), "--user-control-pressed", "ui-cmd=power-off-function")
-    cec(dev, "--to", str(TV), "--user-control-released")
+    return _press_release(dev, "power-off-function")
 
 
-def power_on_tv(dev: str) -> None:
+def power_on_tv(dev: str) -> str:
     """Remote-control 'Power On Function' key: an explicit on, not a toggle."""
-    cec(dev, "--to", str(TV), "--user-control-pressed", "ui-cmd=power-on-function")
-    cec(dev, "--to", str(TV), "--user-control-released")
+    return _press_release(dev, "power-on-function")
 
 
 class WakeTrigger:
     """Fire when the Chromecast wakes but the TV stays in standby.
 
     Arms on Chromecast asleep -> awake while the TV is in standby; a Chromecast that wakes
-    because the TV is already on never arms it. If the TV is still in standby --wake-delay
-    seconds later it fires, then retries every --wake-delay seconds, MAX_ATTEMPTS in all.
-    While the TV is unreachable (typically booting) it waits without firing.
+    because the TV is already on never arms it. It fires almost at once (after FIRST_DELAY_S,
+    just enough to ignore a blip) and then retries every --wake-delay seconds, MAX_ATTEMPTS
+    in all. While the TV is unreachable (typically booting) it waits without firing.
     """
 
-    MAX_ATTEMPTS = 3
+    FIRST_DELAY_S = 2.0
+    MAX_ATTEMPTS = 6
     GIVE_UP_S = 60
 
     def __init__(self, delay: float):
@@ -174,7 +185,7 @@ class WakeTrigger:
                 self.armed_at = self.first_at = now
                 self.attempts = 0
                 msg = (f"Chromecast {self.cc_prev} -> {cc} with TV in standby: "
-                       f"waiting {self.delay:g}s for the TV to turn on by itself")
+                       f"sending Power On in {self.FIRST_DELAY_S:g}s")
         else:
             waited = now - self.first_at
             if tv in AWAKE:
@@ -188,7 +199,8 @@ class WakeTrigger:
                 msg = f"TV still {tv} {waited:.0f}s after the Chromecast woke: giving up"
                 self._disarm()
                 self.cooldown_until = now + COOLDOWN_S
-            elif tv == "standby" and now - self.armed_at >= self.delay:
+            elif tv == "standby" and now - self.armed_at >= (
+                    self.FIRST_DELAY_S if self.attempts == 0 else self.delay):
                 self.attempts += 1
                 fire = True
                 msg = (f"TV still in standby {waited:.0f}s after the Chromecast woke: "
@@ -245,9 +257,8 @@ def main() -> None:
     ap.add_argument("-i", "--interval", type=float, default=3.0)
     ap.add_argument("--delay", type=float, default=5.0,
                     help="seconds the Chromecast must stay in standby before the TV is turned off")
-    ap.add_argument("--wake-delay", type=float, default=8.0,
-                    help="seconds the TV may stay in standby after the Chromecast wakes "
-                         "before Power On is sent")
+    ap.add_argument("--wake-delay", type=float, default=3.0,
+                    help="seconds between Power On retries once the TV is confirmed still asleep")
     ap.add_argument("--no-wake", action="store_true", help="never send Power On to the TV")
     ap.add_argument("--dry-run", action="store_true", help="log what would be sent, send nothing")
     args = ap.parse_args()
@@ -289,8 +300,8 @@ def main() -> None:
                 if args.dry_run:
                     log("DRY RUN: would send Power Off Function to TV")
                 else:
-                    power_off_tv(dev)
-                    log("sent Power Off Function to TV")
+                    res = power_off_tv(dev)
+                    log(f"sent Power Off Function to TV: {res}")
 
             if wake:
                 msg, fire = wake.step(now, states[TV], states[CHROMECAST])
@@ -300,8 +311,8 @@ def main() -> None:
                     if args.dry_run:
                         log("DRY RUN: would send Power On Function to TV")
                     else:
-                        power_on_tv(dev)
-                        log("sent Power On Function to TV")
+                        res = power_on_tv(dev)
+                        log(f"sent Power On Function to TV: {res}")
 
             if sys.stdout.isatty():
                 parts = " | ".join(f"{NAMES[a]} {v} ({now - since[a]:.0f}s)" for a, v in last.items())
