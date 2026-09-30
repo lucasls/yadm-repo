@@ -273,9 +273,11 @@ class Trigger:
                 msg = f"Chromecast {self.cc_prev} -> {cc} with TV on: waiting {self.delay:g}s"
             else:
                 msg = f"Chromecast {self.cc_prev} -> {cc} but TV is {tv}: nothing to do"
-        elif self.armed_at is not None and cc not in ASLEEP:
+        elif self.armed_at is not None and cc in AWAKE:
             self.armed_at = None
             msg = f"Chromecast is {cc} again: cancelled"
+        # A transient NOT ACCESSIBLE (common CEC blip) neither arms nor cancels: only a
+        # real on<->off transition does. The pending timer just keeps waiting through it.
         self.cc_prev = cc if not cc.startswith(NA) else self.cc_prev
 
         if self.armed_at is not None:
