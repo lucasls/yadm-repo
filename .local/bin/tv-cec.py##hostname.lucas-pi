@@ -6,18 +6,30 @@ and the Chromecast (address 8) for their power status. The regular TV query is t
 keep-awake. Each poll ends in a power state (on, standby, to-standby, to-on) or
 "NOT ACCESSIBLE (<reason>)".
 
-TV shutdown: this TV ignores the CEC STANDBY frame the Chromecast sends, but obeys the
-remote-control key "Power Off Function". So when the Chromecast changes from on to
-standby, and stays there for --delay seconds, and the TV is still on, the Pi sends that
-key to the TV. It only reacts to that change, never to the Chromecast merely sitting in
-standby, so watching another input is safe as long as the Chromecast doesn't drop to
-standby on its own when you switch away (see the log after testing that).
+Shutdown drives the TV and soundbar together; wake drives the TV alone (the soundbar acted
+oddly when woken alongside the TV, so it's left for you to turn on). Both are driven purely
+by the Chromecast's state (the soundbar's own CEC status isn't polled, only sent to):
+
+TV/soundbar shutdown: this TV ignores the CEC STANDBY frame the Chromecast sends, but
+obeys the remote-control key "Power Off Function", sent directly to each device (a
+broadcast of the same key does nothing on this TV). So when the Chromecast changes from
+on to standby, and stays there for --delay seconds, and the TV is still on, the Pi sends
+that key to the TV and the soundbar. It only reacts to that change, never to the
+Chromecast merely sitting in standby, so watching another input is safe as long as the
+Chromecast doesn't drop to standby on its own when you switch away (see the log after
+testing that).
 
 TV wake: when the Chromecast wakes (standby -> on) while the TV is in standby, the TV is
 expected to turn on by itself, but in practice this Chromecast's own wake signal doesn't
 reach the TV, so the Pi sends the explicit remote-control key "Power On Function" (the
-counterpart of the off key, not a toggle) almost immediately, retrying every --wake-delay
-seconds until the TV answers. It does nothing if the TV comes on by itself first.
+counterpart of the off key, not a toggle) to the TV alone, almost immediately, retrying
+every --wake-delay seconds until the TV answers. It does nothing if the TV comes on by
+itself first. Testing found this key only reliably wakes the TV when it had gone to
+standby recently (seconds ago); waking it after minutes in standby did not work in any of
+several tries. Sending the same key to the soundbar at the same time also worked in that
+same short-standby test, but was dropped after the soundbar was seen to behave oddly on a
+real cast-and-reconnect, so waking the soundbar is left to you (or the TV's ARC, if it
+turns the soundbar on by itself once the TV is on).
 
 Usage: python3 tv-cec.py [-d /dev/cec1] [-i 3] [--delay 5] [--wake-delay 3] [--no-wake] [--dry-run]
 Log:   stdout (journal under systemd) and ~/.local/share/tv-cec.log
@@ -31,8 +43,8 @@ from datetime import datetime
 from pathlib import Path
 
 LOG_PATH = Path.home() / ".local" / "share" / "tv-cec.log"
-TV, CHROMECAST = 0, 8
-NAMES = {TV: "TV", CHROMECAST: "Chromecast"}
+TV, CHROMECAST, SOUNDBAR = 0, 8, 5
+NAMES = {TV: "TV", CHROMECAST: "Chromecast", SOUNDBAR: "Soundbar"}
 ASLEEP = {"standby", "to-standby"}
 AWAKE = {"on", "to-on"}
 HEARTBEAT_S = 60
@@ -131,25 +143,41 @@ def needs_register(dev: str) -> bool:
     return bool(mask) and int(mask.group(1), 16) == 0
 
 
-def _press_release(dev: str, ui_cmd: str) -> str:
-    """Send a remote-control key to the TV; return 'acked' or the failure, from the press."""
-    out = cec(dev, "--to", str(TV), "--user-control-pressed", f"ui-cmd={ui_cmd}")
-    cec(dev, "--to", str(TV), "--user-control-released")
+def _press_release(dev: str, addr: int, ui_cmd: str) -> str:
+    """Send a remote-control key directly to one device; 'acked' or the failure, from the press.
+
+    Sent directly, never broadcast: a broadcast of the same key had no effect on the TV.
+    """
+    out = cec(dev, "--to", str(addr), "--user-control-pressed", f"ui-cmd={ui_cmd}")
+    cec(dev, "--to", str(addr), "--user-control-released")
     if "Not Acknowledged" in out:
-        return "NACK (TV CEC not listening)"
+        return "NACK (not listening)"
     if "Failed" in out or "timed out" in out:
         return "error: " + out.strip().splitlines()[-1]
     return "acked"
 
 
+def _press_release_all(dev: str, ui_cmd: str) -> str:
+    """Send a remote-control key to the TV and the soundbar; both, individually addressed."""
+    return ", ".join(f"{NAMES[a]}={_press_release(dev, a, ui_cmd)}" for a in (TV, SOUNDBAR))
+
+
 def power_off_tv(dev: str) -> str:
-    """Remote-control 'Power Off Function' key; this TV ignores plain STANDBY."""
-    return _press_release(dev, "power-off-function")
+    """Remote-control 'Power Off Function' key, to the TV and soundbar; this TV ignores plain STANDBY."""
+    return _press_release_all(dev, "power-off-function")
+
+
+def power_off_soundbar(dev: str) -> str:
+    """Remote-control 'Power Off Function' key, to the soundbar alone."""
+    return f"{NAMES[SOUNDBAR]}={_press_release(dev, SOUNDBAR, 'power-off-function')}"
 
 
 def power_on_tv(dev: str) -> str:
-    """Remote-control 'Power On Function' key: an explicit on, not a toggle."""
-    return _press_release(dev, "power-on-function")
+    """Remote-control 'Power On Function' key, to the TV alone: an explicit on, not a toggle.
+
+    Not sent to the soundbar: it behaved oddly (see log) when woken alongside the TV.
+    """
+    return f"{NAMES[TV]}={_press_release(dev, TV, 'power-on-function')}"
 
 
 class WakeTrigger:
@@ -161,8 +189,8 @@ class WakeTrigger:
     in all. While the TV is unreachable (typically booting) it waits without firing.
     """
 
-    FIRST_DELAY_S = 2.0
-    MAX_ATTEMPTS = 6
+    FIRST_DELAY_S = 1.0
+    MAX_ATTEMPTS = 20
     GIVE_UP_S = 60
 
     def __init__(self, delay: float):
@@ -215,24 +243,33 @@ class WakeTrigger:
 
 
 class Trigger:
-    """Fire once when the Chromecast goes awake -> asleep and the TV is still on.
+    """Fire in two stages when the Chromecast goes awake -> asleep while the TV is on.
 
-    step() takes the latest states and returns None, or a log message when the TV
-    should be turned off now. Time is passed in so this is testable.
+    Sending Power Off to the TV and soundbar at the same moment left the soundbar still
+    on (it acks the key but doesn't act on it fast enough), so the soundbar now gets a
+    head start: at half of --delay it's sent alone, then at the full --delay the TV and
+    soundbar are sent together (a harmless second nudge to the soundbar). Cancels if the
+    Chromecast wakes back up before the final stage.
+
+    step() returns (message, action), action one of None, "soundbar_off", "power_off".
+    Time is passed in so this is testable.
     """
 
     def __init__(self, delay: float):
         self.delay = delay
+        self.lead = delay / 2
         self.cc_prev: str | None = None
         self.armed_at: float | None = None
+        self.soundbar_sent = False
         self.cooldown_until = 0.0
 
-    def step(self, now: float, tv: str, cc: str) -> tuple[str | None, bool]:
-        """Return (message, fire)."""
-        msg = None
+    def step(self, now: float, tv: str, cc: str) -> tuple[str | None, str | None]:
+        """Return (message, action)."""
+        msg, action = None, None
         if self.cc_prev in AWAKE and cc in ASLEEP and now >= self.cooldown_until:
             if tv == "on":
                 self.armed_at = now
+                self.soundbar_sent = False
                 msg = f"Chromecast {self.cc_prev} -> {cc} with TV on: waiting {self.delay:g}s"
             else:
                 msg = f"Chromecast {self.cc_prev} -> {cc} but TV is {tv}: nothing to do"
@@ -241,23 +278,31 @@ class Trigger:
             msg = f"Chromecast is {cc} again: cancelled"
         self.cc_prev = cc if not cc.startswith(NA) else self.cc_prev
 
-        if self.armed_at is not None and now - self.armed_at >= self.delay:
-            self.armed_at = None
-            if tv == "on":
-                self.cooldown_until = now + COOLDOWN_S
-                return f"Chromecast still {cc} and TV still on: turning TV off", True
-            return f"TV is {tv} now: not sending power-off", False
-        return msg, False
+        if self.armed_at is not None:
+            waited = now - self.armed_at
+            if waited >= self.delay:
+                self.armed_at = None
+                if tv == "on":
+                    self.cooldown_until = now + COOLDOWN_S
+                    action = "power_off"
+                    msg = f"Chromecast still {cc} and TV still on: turning TV off"
+                else:
+                    msg = f"TV is {tv} now: not sending power-off"
+            elif not self.soundbar_sent and waited >= self.lead and tv == "on":
+                self.soundbar_sent = True
+                action = "soundbar_off"
+                msg = f"{waited:.0f}s in: turning soundbar off first, TV follows at {self.delay:g}s"
+        return msg, action
 
 
 def main() -> None:
     global _log_file, _live_shown
     ap = argparse.ArgumentParser()
     ap.add_argument("-d", "--device", default="/dev/cec1")
-    ap.add_argument("-i", "--interval", type=float, default=3.0)
+    ap.add_argument("-i", "--interval", type=float, default=1.0)
     ap.add_argument("--delay", type=float, default=5.0,
                     help="seconds the Chromecast must stay in standby before the TV is turned off")
-    ap.add_argument("--wake-delay", type=float, default=3.0,
+    ap.add_argument("--wake-delay", type=float, default=1.0,
                     help="seconds between Power On retries once the TV is confirmed still asleep")
     ap.add_argument("--no-wake", action="store_true", help="never send Power On to the TV")
     ap.add_argument("--dry-run", action="store_true", help="log what would be sent, send nothing")
@@ -293,15 +338,21 @@ def main() -> None:
                     last[addr] = st
                     since[addr] = now
 
-            msg, fire = trigger.step(now, states[TV], states[CHROMECAST])
+            msg, action = trigger.step(now, states[TV], states[CHROMECAST])
             if msg:
                 log(msg)
-            if fire:
+            if action == "soundbar_off":
                 if args.dry_run:
-                    log("DRY RUN: would send Power Off Function to TV")
+                    log("DRY RUN: would send Power Off Function to Soundbar (lead-in)")
+                else:
+                    res = power_off_soundbar(dev)
+                    log(f"sent Power Off Function (lead-in): {res}")
+            elif action == "power_off":
+                if args.dry_run:
+                    log("DRY RUN: would send Power Off Function to TV+Soundbar")
                 else:
                     res = power_off_tv(dev)
-                    log(f"sent Power Off Function to TV: {res}")
+                    log(f"sent Power Off Function: {res}")
 
             if wake:
                 msg, fire = wake.step(now, states[TV], states[CHROMECAST])
@@ -312,7 +363,7 @@ def main() -> None:
                         log("DRY RUN: would send Power On Function to TV")
                     else:
                         res = power_on_tv(dev)
-                        log(f"sent Power On Function to TV: {res}")
+                        log(f"sent Power On Function: {res}")
 
             if sys.stdout.isatty():
                 parts = " | ".join(f"{NAMES[a]} {v} ({now - since[a]:.0f}s)" for a, v in last.items())
