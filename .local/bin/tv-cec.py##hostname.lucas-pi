@@ -50,6 +50,7 @@ AWAKE = {"on", "to-on"}
 HEARTBEAT_S = 60
 COOLDOWN_S = 30
 NA = "NOT ACCESSIBLE"
+RESCAN_S = 30
 
 _log_file = None
 _live_shown = False
@@ -297,10 +298,28 @@ class Trigger:
         return msg, action
 
 
+def find_tv_device() -> str | None:
+    """Return the /dev/cecN whose HDMI port is connected and where the TV answers, else None.
+
+    Only adapters whose HDMI connector reports 'connected' are probed, so unused ports
+    (which would just time out) are skipped.
+    """
+    connected = []
+    for dev in sorted(Path("/dev").glob("cec[0-9]*"), key=lambda p: p.name):
+        dev = str(dev)
+        if hdmi_status(cec(dev)) != "connected":
+            continue
+        connected.append(dev)
+        register(dev)
+        if not query(dev, TV).startswith(NA):
+            return dev
+    return connected[0] if connected else None
+
+
 def main() -> None:
     global _log_file, _live_shown
     ap = argparse.ArgumentParser()
-    ap.add_argument("-d", "--device", default="/dev/cec1")
+    ap.add_argument("-d", "--device", default="auto", help="CEC adapter, or auto to find the TV")
     ap.add_argument("-i", "--interval", type=float, default=1.0)
     ap.add_argument("--delay", type=float, default=5.0,
                     help="seconds the Chromecast must stay in standby before the TV is turned off")
@@ -310,6 +329,9 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="log what would be sent, send nothing")
     args = ap.parse_args()
     dev = args.device
+    if dev == "auto":
+        dev = find_tv_device() or "/dev/cec1"
+        log(f"auto-detected CEC device: {dev}")
 
     _log_file = open(LOG_PATH, "a")
     log(f"start: dev={dev} interval={args.interval:g}s delay={args.delay:g}s "
@@ -324,11 +346,19 @@ def main() -> None:
     since: dict[int, float] = {}
     polls = 0
     next_beat = time.monotonic() + HEARTBEAT_S
+    next_rescan = 0.0
     next_poll = time.monotonic()
     try:
         while True:
             now = time.monotonic()
             states = {addr: query(dev, addr) for addr in (TV, CHROMECAST)}
+            if args.device == "auto" and states[TV].startswith(NA) and now >= next_rescan:
+                next_rescan = now + RESCAN_S
+                found = find_tv_device()
+                if found and found != dev:
+                    log(f"TV not reachable on {dev}: switching to {found}")
+                    dev = found
+                    states = {addr: query(dev, addr) for addr in (TV, CHROMECAST)}
             polls += 1
             if any("adapter unregistered" in s for s in states.values()):
                 register(dev)
